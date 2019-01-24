@@ -6,7 +6,6 @@ edition = "2018"
 
 [dependencies]
 bytes = "0.4"
-etherparse = "0.8"
 futures = "0.1"
 http = "0.1"
 hyper = "0.12"
@@ -17,3 +16,7 @@ ron = "0.4"
 rpassword = "2"
 select = "0.4"
 serde = "1"
+
+[dependencies.etherparse]
+version = "0.8"
+# path = "../etherparse"

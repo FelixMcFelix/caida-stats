@@ -22,9 +22,9 @@ impl VolumeStat {
 		self.volume += size;
 	}
 
-	pub fn packet_unsized(&mut self) {
-		self.count+= 1;
-	}
+	// pub fn packet_unsized(&mut self) {
+	// 	self.count+= 1;
+	// }
 }
 
 impl Add for VolumeStat {

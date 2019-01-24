@@ -1,21 +1,30 @@
+mod chunkreader;
 mod stats;
 
-use bytes::Bytes;
+use crate::{
+	chunkreader::ChunkReader,
+	stats::{
+		PacketVolumeStats,
+		VolumeStat,
+	},
+};
 use etherparse::{
 	IpHeader,
+	IpTrafficClass,
 	PacketHeaders,
 	ReadError as EtherReadError,
 	TransportHeader,
 };
 use futures::{
+	future::{
+		self,
+		Loop,
+	},
 	Future,
 	Stream,
 };
 use http::Error as HttpError;
-use hyper::{
-	rt,
-	Chunk,
-};
+use hyper::rt;
 use libflate::gzip::MultiDecoder as Decoder;
 use pcap_file::{
 	Error as PcapError,
@@ -24,20 +33,19 @@ use pcap_file::{
 };
 use reqwest::{
 	r#async::{
-		Chunk as AsyncChunk,
 		Client as AsyncClient,
 		RequestBuilder as AsyncRequestBuilder,
 	},
 	Client,
 	Error as ReqwestError,
 };
+use ron::ser::{
+	self,
+	Error as RonSerError,
+};
 use select::{
 	document::Document,
 	predicate::Name,
-};
-use stats::{
-	PacketVolumeStats,
-	VolumeStat,
 };
 use std::{
 	error::Error,
@@ -47,10 +55,11 @@ use std::{
 		File,
 	},
 	io::{
-		self,
 		Error as IoError,
 		Read,
-		Result as IoResult,
+		Seek,
+		SeekFrom,
+		Write,
 	},
 	sync::{
 		mpsc,
@@ -59,6 +68,7 @@ use std::{
 };
 
 const DATA_URL: &str = "https://data.caida.org/datasets/passive-2018/equinix-nyc/";
+const MAX_PARALLEL_REQUESTS: usize = 10;
 
 fn main() -> LocalResult<()> {
 	// Get/process username
@@ -110,7 +120,7 @@ fn main() -> LocalResult<()> {
 
 		let mut ron_files = vec![];
 
-		for file in files {
+		for file in files.collect::<Vec<_>>().into_iter().rev() {
 			new_root.push_str(file);
 			let before_ron_len = new_root.len();
 			new_root.push_str(".ron");
@@ -124,12 +134,12 @@ fn main() -> LocalResult<()> {
 				println!("DLing {}", &new_root[..before_ron_len]);
 
 				// Create file and do some stream magic...
-				// ron_files.push(
+				ron_files.push(
 					process_file(
 						async_resp,
 						&new_root[start_index..],
 					)?
-				// );
+				);
 			}
 
 			// dbg!(file);
@@ -146,73 +156,17 @@ fn main() -> LocalResult<()> {
 	Ok(())
 }
 
-struct ChunkReader{
-	inner: mpsc::Receiver<AsyncChunk>,
-	leftover: Option<Bytes>,
-}
-
-impl ChunkReader {
-	fn new(inner: mpsc::Receiver<AsyncChunk>) -> Self {
-		Self {
-			inner,
-			leftover: None,
-		}
-	}
-}
-
-impl Read for ChunkReader {
-	fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-		let init = buf.len();
-		let mut remaining = init;
-
-		// Might start with a "leftover" chunk, also need
-		// to then loop on trying to receive further chunks.
-		let mut current = None;
-		
-		while remaining > 0 {
-			current = self.leftover.take();
-
-			let ask_new = if let Some(c) = &mut current {
-				let open = remaining.min(c.len());
-				buf[..open].copy_from_slice(&c.split_to(open));
-
-				remaining -= open;
-
-				c.len() == 0
-			} else {
-				true
-			};
-
-			self.leftover = if ask_new {
-				let mesg = self.inner.recv();
-
-				if let Err(_) = mesg {
-					return Err(IoError::new(
-						io::ErrorKind::UnexpectedEof,
-						"Chunk Sources disconnected.",
-					));
-				}
-
-				mesg.ok()
-					.map(Into::into)
-					.map(Chunk::into_bytes)
-			} else {
-				current
-			};
-
-			if self.leftover.is_none() { break; }
-		}
-
-		Ok(init - remaining)
-	}
-}
-
-fn process_file(request: AsyncRequestBuilder, out_file: &str) -> LocalResult<()> {
+fn process_file(request: AsyncRequestBuilder, out_file: &str) -> LocalResult<File> {
 	let (tx, rx) = mpsc::sync_channel(4096);
 
 	thread::spawn(move || {
 		println!("Started child thread.");
 		let safe_tx = tx;
+
+		// Need to loop until we don't get a 503.
+		future::loop_fn(|state| {
+			request
+		});
 		let a = request.send()
 			.map_err(|e| println!("Error sending request: {:?}", e))
 			.and_then(|resp| {
@@ -220,6 +174,7 @@ fn process_file(request: AsyncRequestBuilder, out_file: &str) -> LocalResult<()>
 				resp.into_body()
 					.map_err(|e| println!("Bad response: {:?}", e))
 					.for_each(move |chunk| {
+						dbg!(&chunk);
 						safe_tx
 							.send(chunk)
 							.map_err(|e|
@@ -238,26 +193,31 @@ fn process_file(request: AsyncRequestBuilder, out_file: &str) -> LocalResult<()>
 
 	let mut stats_ongoing: PacketVolumeStats = Default::default();
 
-	let mut i = 0;
-
-	for pcap in pcap_stream {
+	for (i, pcap) in pcap_stream.enumerate().take(100) {
 		if let Ok(pcap) = pcap {
-			let Packet {header, data} = pcap;
-			if let Err(e) = packet_volume(&mut stats_ongoing, &data) {
-				println!("Weird packet: {:?}, len: {}, {:x?}, proto: {}", e, &data.len(), &data, data[9]);
+			let Packet { data, .. } = pcap;
+			if packet_volume(&mut stats_ongoing, &data).is_err() {
+				// I know from looking at the data that it probably died for two reasons...
+				// 1: chopped in the middle of the TCP options block (due to variable length SACK).
+				// 2: No UDP header (???)
+				// This function should do simpler mining...
+				if let Err(e) = packet_volume_emergency(&mut stats_ongoing, &data) {
+					println!("Weird packet: {:?}, len: {}, {:x?}, proto: {}", e, &data.len(), &data, data[9]);
+				}
 			}
 		}
 
-		i += 1;
-
-		if i % 10000 == 0 {
-			dbg!(stats_ongoing);
+		if i % 100_000 == 0 {
+			println!("{}: {} = {:?}", out_file, i, stats_ongoing);
 		}
 	}
 
+	let mut out = File::create(out_file)?;
 
+	out.write_all(ser::to_string(&stats_ongoing)?.as_bytes())?;
+	out.seek(SeekFrom::Start(0))?;
 
-	Ok(())
+	Ok(out)
 }
 
 fn packet_volume(stats: &mut PacketVolumeStats, data: &[u8]) -> Result<(), EtherReadError> {
@@ -270,15 +230,34 @@ fn packet_volume(stats: &mut PacketVolumeStats, data: &[u8]) -> Result<(), Ether
 	}.into();
 
 	match pkt.transport {
-		Some(TransportHeader::Tcp(h)) => stats.tcp.packet(pkt_size),
-		Some(TransportHeader::Udp(h)) => match h.destination_port {
-			80 | 443 => stats.quic.packet(pkt_size),
+		Some(TransportHeader::Tcp(_h)) => stats.tcp.packet(pkt_size),
+		Some(TransportHeader::Udp(h)) => match (h.destination_port, h.source_port) {
+			(80, _) | (443, _) |
+			(_, 80) | (_, 443) => stats.quic.packet(pkt_size),
 			_ => stats.udp_non_quic.packet(pkt_size),
 		},
 		_ => stats.other.packet(pkt_size),
 	}
 
-	// println!("{:?}", pkt);
+	Ok(())
+}
+
+fn packet_volume_emergency(stats: &mut PacketVolumeStats, data: &[u8]) -> Result<(), EtherReadError> {
+	let (ip, _rest) = IpHeader::read_from_slice(data)?;
+
+	let (len, proto) = match ip {
+		IpHeader::Version4(h) => (h.payload_len.into(), h.protocol),
+		IpHeader::Version6(h) => (h.payload_length.into(), h.traffic_class),
+	};
+
+	const UDP: u8 = IpTrafficClass::Udp as u8;
+	const TCP: u8 = IpTrafficClass::Tcp as u8;
+
+	match proto {
+		UDP => stats.udp_non_quic.packet(len),
+		TCP => stats.tcp.packet(len),
+		_ =>  stats.other.packet(len),
+	}
 
 	Ok(())
 }
@@ -298,6 +277,7 @@ enum LocalError {
 	Io(IoError),
 	Pcap(PcapError),
 	Reqwest(ReqwestError),
+	RonSer(RonSerError),
 }
 
 impl Error for LocalError {
@@ -309,6 +289,7 @@ impl Error for LocalError {
 			Io(e) => e.description(),
 			Pcap(e) => e.description(),
 			Reqwest(e) => e.description(),
+			RonSer(e) => e.description(),
 		}
 	}
 }
@@ -322,6 +303,7 @@ impl fmt::Display for LocalError {
 			Io(e) => e.fmt(f),
 			Pcap(e) => e.fmt(f),
 			Reqwest(e) => e.fmt(f),
+			RonSer(e) => e.fmt(f),
 		}
 	}
 }
@@ -347,6 +329,12 @@ impl From<PcapError> for LocalError {
 impl From<ReqwestError> for LocalError {
 	fn from(t: ReqwestError) -> Self {
 		LocalError::Reqwest(t)
+	}
+}
+
+impl From<RonSerError> for LocalError {
+	fn from(t: RonSerError) -> Self {
+		LocalError::RonSer(t)
 	}
 }
 
