@@ -48,7 +48,8 @@ impl AddAssign for VolumeStat {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PacketVolumeStats {
 	pub udp_non_quic: VolumeStat,
-	pub quic: VolumeStat,
+	pub udp_unknown: VolumeStat,
+	pub udp_quic: VolumeStat,
 	pub tcp: VolumeStat,
 	pub other: VolumeStat,
 }
@@ -58,7 +59,8 @@ impl Default for PacketVolumeStats {
 		let stat: VolumeStat = Default::default();
 		Self {
 			udp_non_quic: stat,
-			quic: stat,
+			udp_unknown: stat,
+			udp_quic: stat,
 			tcp: stat,
 			other: stat,
 		}

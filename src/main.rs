@@ -18,6 +18,7 @@ use etherparse::{
 use futures::{
 	future::{
 		self,
+		Either,
 		Loop,
 	},
 	Future,
@@ -26,11 +27,13 @@ use futures::{
 use http::Error as HttpError;
 use hyper::rt;
 use libflate::gzip::MultiDecoder as Decoder;
+use parking_lot::RwLock;
 use pcap_file::{
 	Error as PcapError,
 	Packet,
 	PcapReader,
 };
+use rand::Rng;
 use reqwest::{
 	r#async::{
 		Client as AsyncClient,
@@ -63,12 +66,23 @@ use std::{
 	},
 	sync::{
 		mpsc,
+		Arc,
 	},
 	thread,
+	time::{
+		Duration,
+		Instant,
+	},
 };
+use tokio::timer::Delay;
 
 const DATA_URL: &str = "https://data.caida.org/datasets/passive-2018/equinix-nyc/";
 const MAX_PARALLEL_REQUESTS: usize = 10;
+const MIN_RETRY_DELAY: u64 = 1_000;
+const MAX_RETRY_DELAY: u64 = 5_000;
+
+type ClientData = (AsyncClient, String, String);
+type LockedClientData = Arc<RwLock<ClientData>>;
 
 fn main() -> LocalResult<()> {
 	// Get/process username
@@ -80,14 +94,14 @@ fn main() -> LocalResult<()> {
 	// 	user.pop();
 	// }
 
-	let user = "k.simpson.1@research.gla.ac.uk";
+	let user = "k.simpson.1@research.gla.ac.uk".to_string();
 
 	// Get password.
 	let password = rpassword::prompt_password_stdout("Password:")?;
 	println!();
 
 	let client = Client::new();
-	let async_client = AsyncClient::new();
+	let async_client = Arc::new(RwLock::new((AsyncClient::new(), user.clone(), password.clone())));
 
 	// Top-level request
 	let resp = client.get(DATA_URL)
@@ -120,7 +134,7 @@ fn main() -> LocalResult<()> {
 
 		let mut ron_files = vec![];
 
-		for file in files.collect::<Vec<_>>().into_iter().rev() {
+		for file in files {
 			new_root.push_str(file);
 			let before_ron_len = new_root.len();
 			new_root.push_str(".ron");
@@ -128,16 +142,17 @@ fn main() -> LocalResult<()> {
 			if let Ok(local_file) = File::open(&new_root[start_index..]) {
 				ron_files.push(local_file);
 			} else {
-				let async_resp = async_client.get(&new_root[..before_ron_len])
-					.basic_auth(&user, Some(&password));
+				
 
-				println!("DLing {}", &new_root[..before_ron_len]);
+				// println!("DLing {}", &new_root[..before_ron_len]);
 
 				// Create file and do some stream magic...
 				ron_files.push(
 					process_file(
-						async_resp,
-						&new_root[start_index..],
+						async_client.clone(),
+						new_root.clone(),
+						start_index,
+						before_ron_len,
 					)?
 				);
 			}
@@ -156,25 +171,80 @@ fn main() -> LocalResult<()> {
 	Ok(())
 }
 
-fn process_file(request: AsyncRequestBuilder, out_file: &str) -> LocalResult<File> {
+fn process_file(
+		client_data: LockedClientData,
+		file_string: String,
+		new_index: usize,
+		url_index: usize,
+	) -> LocalResult<File> {
 	let (tx, rx) = mpsc::sync_channel(4096);
+	let out_file = &file_string[new_index..];
+
+	let file_string_inner = file_string.clone();
+	let url_index_inner = url_index;
 
 	thread::spawn(move || {
 		println!("Started child thread.");
 		let safe_tx = tx;
 
 		// Need to loop until we don't get a 503.
-		future::loop_fn(|state| {
-			request
-		});
+		// let r_2 = request.clone();
+		let request = {
+			let data_lock = client_data.clone();
+			let (ref client, ref user, ref password) = *data_lock.read();
+
+			client.get(&file_string_inner[..url_index])
+				.basic_auth(&user, Some(&password))
+		};
+
 		let a = request.send()
+			.map(move |resp| (resp, client_data))
 			.map_err(|e| println!("Error sending request: {:?}", e))
+			.and_then(move |x| future::loop_fn(x, move |(resp, client_data)| {
+				// Server might have 503'd us. Keep trying.
+				match resp.headers().get("connection") {
+					// Have to destructure, THEN compare...
+					Some(a) => {
+						if a == "close" {
+							let request = {
+								let data_lock = client_data.clone();
+								let (ref client, ref user, ref password) = *data_lock.read();
+
+								client.get(&file_string_inner[..url_index_inner])
+									.basic_auth(&user, Some(&password))
+							};
+							return Either::A(
+								Delay::new(
+										Instant::now() +
+										Duration::from_millis(
+											rand::thread_rng().gen_range(
+												MIN_RETRY_DELAY,
+												MAX_RETRY_DELAY,
+											)
+										)
+									)
+									.map_err(|_| ())
+									.and_then(move |_|
+										request.send()
+											.map(move |r| Loop::Continue((r, client_data)))
+											.map_err(|e|
+												println!("Error sending request: {:?}", e)
+											)
+									)
+							);
+						}
+					},
+					_ => {},
+				}
+
+				Either::B(future::ok(Loop::Break(resp)))
+			}))
 			.and_then(|resp| {
 				println!("Got a response... {:?}", resp.headers());
 				resp.into_body()
 					.map_err(|e| println!("Bad response: {:?}", e))
 					.for_each(move |chunk| {
-						dbg!(&chunk);
+						// dbg!(&chunk);
 						safe_tx
 							.send(chunk)
 							.map_err(|e|
@@ -193,7 +263,7 @@ fn process_file(request: AsyncRequestBuilder, out_file: &str) -> LocalResult<Fil
 
 	let mut stats_ongoing: PacketVolumeStats = Default::default();
 
-	for (i, pcap) in pcap_stream.enumerate().take(100) {
+	for (i, pcap) in pcap_stream.enumerate() {//.take(100) {
 		if let Ok(pcap) = pcap {
 			let Packet { data, .. } = pcap;
 			if packet_volume(&mut stats_ongoing, &data).is_err() {
@@ -233,7 +303,7 @@ fn packet_volume(stats: &mut PacketVolumeStats, data: &[u8]) -> Result<(), Ether
 		Some(TransportHeader::Tcp(_h)) => stats.tcp.packet(pkt_size),
 		Some(TransportHeader::Udp(h)) => match (h.destination_port, h.source_port) {
 			(80, _) | (443, _) |
-			(_, 80) | (_, 443) => stats.quic.packet(pkt_size),
+			(_, 80) | (_, 443) => stats.udp_quic.packet(pkt_size),
 			_ => stats.udp_non_quic.packet(pkt_size),
 		},
 		_ => stats.other.packet(pkt_size),
@@ -254,7 +324,7 @@ fn packet_volume_emergency(stats: &mut PacketVolumeStats, data: &[u8]) -> Result
 	const TCP: u8 = IpTrafficClass::Tcp as u8;
 
 	match proto {
-		UDP => stats.udp_non_quic.packet(len),
+		UDP => stats.udp_unknown.packet(len),
 		TCP => stats.tcp.packet(len),
 		_ =>  stats.other.packet(len),
 	}

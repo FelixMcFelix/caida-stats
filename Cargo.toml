@@ -6,17 +6,17 @@ edition = "2018"
 
 [dependencies]
 bytes = "0.4"
+etherparse = "0.8"
 futures = "0.1"
 http = "0.1"
 hyper = "0.12"
 libflate = "0.1"
+parking_lot = "0.7"
 pcap-file = "0.10"
+rand = "0.6"
 reqwest = "0.9"
 ron = "0.4"
 rpassword = "2"
 select = "0.4"
 serde = "1"
-
-[dependencies.etherparse]
-version = "0.8"
-# path = "../etherparse"
+tokio = "0.1.14"
