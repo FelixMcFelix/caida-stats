@@ -1,13 +1,13 @@
 mod chunkreader;
+mod error;
 mod stats;
 
 use crate::{
 	chunkreader::ChunkReader,
-	stats::{
-		PacketVolumeStats,
-		VolumeStat,
-	},
+	error::*,
+	stats::*,
 };
+use csv::Writer;
 use etherparse::{
 	IpHeader,
 	IpTrafficClass,
@@ -24,42 +24,34 @@ use futures::{
 	Future,
 	Stream,
 };
-use http::Error as HttpError;
 use hyper::rt;
 use libflate::gzip::MultiDecoder as Decoder;
 use parking_lot::RwLock;
 use pcap_file::{
-	Error as PcapError,
 	Packet,
 	PcapReader,
 };
 use rand::Rng;
 use reqwest::{
-	r#async::{
-		Client as AsyncClient,
-		RequestBuilder as AsyncRequestBuilder,
-	},
+	r#async::Client as AsyncClient,
 	Client,
-	Error as ReqwestError,
 };
-use ron::ser::{
-	self,
-	Error as RonSerError,
+use ron::{
+	de,
+	ser,
 };
 use select::{
 	document::Document,
 	predicate::Name,
 };
+use serde::Serialize;
 use std::{
-	error::Error,
-	fmt,
 	fs::{
 		self,
 		File,
 	},
 	io::{
-		Error as IoError,
-		Read,
+		self,
 		Seek,
 		SeekFrom,
 		Write,
@@ -76,25 +68,29 @@ use std::{
 };
 use tokio::timer::Delay;
 
+type Pvs = PacketVolumeStats;
+type Pvs3 = (Pvs, Pvs, Pvs);
+type OutPartition = (&'static str, fn(Pvs3) -> Pvs);
+
 const DATA_URL: &str = "https://data.caida.org/datasets/passive-2018/equinix-nyc/";
-const MAX_PARALLEL_REQUESTS: usize = 10;
 const MIN_RETRY_DELAY: u64 = 1_000;
 const MAX_RETRY_DELAY: u64 = 5_000;
+
+const MONTH_PATCHES: &[usize] = &[10, 5, 2, 1];
+const RESULTS_DIR: &str = "results/";
 
 type ClientData = (AsyncClient, String, String);
 type LockedClientData = Arc<RwLock<ClientData>>;
 
 fn main() -> LocalResult<()> {
 	// Get/process username
-	// print!("User: ");
-	// io::stdout().flush();
-	// let mut user = String::new();
-	// io::stdin().read_line(&mut user);
-	// while user.ends_with('\n') || user.ends_with('\r') {
-	// 	user.pop();
-	// }
-
-	let user = "k.simpson.1@research.gla.ac.uk".to_string();
+	print!("User: ");
+	io::stdout().flush()?;
+	let mut user = String::new();
+	io::stdin().read_line(&mut user)?;
+	while user.ends_with('\n') || user.ends_with('\r') {
+		user.pop();
+	}
 
 	// Get password.
 	let password = rpassword::prompt_password_stdout("Password:")?;
@@ -112,6 +108,8 @@ fn main() -> LocalResult<()> {
 
 	let mut new_root = DATA_URL.to_string();
 	let start_index = DATA_URL.len();
+
+	let mut month_stats = vec![];
 
 	// Narrow down to the set of correct pages...
 	for link in get_important_links(&doc) {
@@ -138,37 +136,119 @@ fn main() -> LocalResult<()> {
 			new_root.push_str(file);
 			let before_ron_len = new_root.len();
 			new_root.push_str(".ron");
+
+			let dir_a = file.contains("dirA");
+
 			// Check if stats already written to disk.
 			if let Ok(local_file) = File::open(&new_root[start_index..]) {
-				ron_files.push(local_file);
+				ron_files.push((local_file, dir_a));
 			} else {
-				
-
-				// println!("DLing {}", &new_root[..before_ron_len]);
-
 				// Create file and do some stream magic...
-				ron_files.push(
+				ron_files.push((
 					process_file(
 						async_client.clone(),
 						new_root.clone(),
 						start_index,
 						before_ron_len,
-					)?
-				);
+					)?,
+					dir_a,
+				));
 			}
 
-			// dbg!(file);
 			new_root.truncate(clip_len);
 		}
 
 		// Now combine stuff from all files...
-		// TODO
+		// We should get 3 sets of counts for each month: 
+		let all_files = ron_files.into_iter()
+			.map(|(f, d)|
+				(de::from_reader::<_, Pvs>(f).expect("Couldn't unpack file..."), d)
+			);
+
+		let (a_total, b_total) = all_files
+			.fold(
+				(Pvs::default(), Pvs::default()),
+				|(acc_a, acc_b), (x, dir_a)| if dir_a {
+					(acc_a + x, acc_b)
+				} else {
+					(acc_a, acc_b + x)
+				},
+			);
+
+		let all_total = a_total + b_total;
 
 		new_root.truncate(start_index);
+
+		month_stats.push((all_total, a_total, b_total));
 	}
 
+	let settings: [OutPartition; 3] = {
+		[
+			("biDir", pvs_0),
+			("dirA", pvs_1),
+			("dirB", pvs_2),
+		]
+	};
+
+	let _ = fs::create_dir_all(RESULTS_DIR);
+	let mut month_stats = month_stats.into_iter();
+
+	#[inline]
+	fn patch_size_string(patch_size: usize, i: usize) -> String {
+		if patch_size > 1 {
+			format!("{}-{}", i - patch_size + 1, i)
+		} else {
+			format!("{}", i)
+		}
+	}
+
+	for patch_size in MONTH_PATCHES {
+		for (name_mod, extract_fn) in &settings {
+			let mut wrt = Writer::from_path(format!("{0}{1}-{2}.csv", RESULTS_DIR, name_mod, patch_size))?;
+			let mut current_stat = None;
+
+			for (i, month) in month_stats.by_ref().map(extract_fn).enumerate() {
+				current_stat = if let Some(s) = current_stat {
+					Some(s + month)
+				} else {
+					Some(month)
+				};
+
+				if (i + 1) % patch_size == 0 {
+					// Write out the row.
+					wrt.serialize(VolumeStatRow::new(
+						&patch_size_string(*patch_size, i),
+						current_stat.expect("...")
+					))?;
+					current_stat = None;
+				}
+			}
+
+			if let Some(c) = current_stat {
+				wrt.serialize(VolumeStatRow::new(
+					&patch_size_string(*patch_size, month_stats.len() - 1),
+					c,
+				))?;
+			}
+		}
+	}
 
 	Ok(())
+}
+
+fn pvs_0(x: Pvs3) -> Pvs { x.0 }
+fn pvs_1(x: Pvs3) -> Pvs { x.1 }
+fn pvs_2(x: Pvs3) -> Pvs { x.2 }
+
+fn save_and_scan_back<S>(out_file: &str, to_save: S) -> LocalResult<File>
+	where S: Serialize
+{
+	let mut out = File::create(out_file)?;
+
+	out.write_all(ser::to_string(&to_save)?.as_bytes())?;
+	out.seek(SeekFrom::Start(0))?;
+
+	Ok(out)
 }
 
 fn process_file(
@@ -188,7 +268,6 @@ fn process_file(
 		let safe_tx = tx;
 
 		// Need to loop until we don't get a 503.
-		// let r_2 = request.clone();
 		let request = {
 			let data_lock = client_data.clone();
 			let (ref client, ref user, ref password) = *data_lock.read();
@@ -202,49 +281,48 @@ fn process_file(
 			.map_err(|e| println!("Error sending request: {:?}", e))
 			.and_then(move |x| future::loop_fn(x, move |(resp, client_data)| {
 				// Server might have 503'd us. Keep trying.
-				match resp.headers().get("connection") {
+				if let Some(a) = resp.headers().get("connection") {
 					// Have to destructure, THEN compare...
-					Some(a) => {
-						if a == "close" {
-							let request = {
-								let data_lock = client_data.clone();
-								let (ref client, ref user, ref password) = *data_lock.read();
+					if a == "close" {
+						let request = {
+							let data_lock = client_data.clone();
+							let (ref client, ref user, ref password) = *data_lock.read();
 
-								client.get(&file_string_inner[..url_index_inner])
-									.basic_auth(&user, Some(&password))
-							};
-							return Either::A(
-								Delay::new(
-										Instant::now() +
-										Duration::from_millis(
-											rand::thread_rng().gen_range(
-												MIN_RETRY_DELAY,
-												MAX_RETRY_DELAY,
-											)
-										)
+							client.get(&file_string_inner[..url_index_inner])
+								.basic_auth(&user, Some(&password))
+						};
+						
+						Either::A(
+							Delay::new(
+								Instant::now() +
+								Duration::from_millis(
+									rand::thread_rng().gen_range(
+										MIN_RETRY_DELAY,
+										MAX_RETRY_DELAY,
 									)
-									.map_err(|_| ())
-									.and_then(move |_|
-										request.send()
-											.map(move |r| Loop::Continue((r, client_data)))
-											.map_err(|e|
-												println!("Error sending request: {:?}", e)
-											)
+								)
+							)
+							.map_err(|_| ())
+							.and_then(move |_|
+								request.send()
+									.map(move |r| Loop::Continue((r, client_data)))
+									.map_err(|e|
+										println!("Error sending request: {:?}", e)
 									)
-							);
-						}
-					},
-					_ => {},
+							)
+						)
+					} else {
+						Either::B(future::ok(Loop::Break(resp)))
+					}
+				} else {
+					Either::B(future::ok(Loop::Break(resp)))
 				}
-
-				Either::B(future::ok(Loop::Break(resp)))
 			}))
 			.and_then(|resp| {
 				println!("Got a response... {:?}", resp.headers());
 				resp.into_body()
 					.map_err(|e| println!("Bad response: {:?}", e))
 					.for_each(move |chunk| {
-						// dbg!(&chunk);
 						safe_tx
 							.send(chunk)
 							.map_err(|e|
@@ -261,7 +339,7 @@ fn process_file(
 	let gzip_stream = Decoder::new(stream)?;
 	let pcap_stream = PcapReader::new(gzip_stream)?;
 
-	let mut stats_ongoing: PacketVolumeStats = Default::default();
+	let mut stats_ongoing = Pvs::default();
 
 	for (i, pcap) in pcap_stream.enumerate() {//.take(100) {
 		if let Ok(pcap) = pcap {
@@ -282,15 +360,10 @@ fn process_file(
 		}
 	}
 
-	let mut out = File::create(out_file)?;
-
-	out.write_all(ser::to_string(&stats_ongoing)?.as_bytes())?;
-	out.seek(SeekFrom::Start(0))?;
-
-	Ok(out)
+	save_and_scan_back(out_file, stats_ongoing)
 }
 
-fn packet_volume(stats: &mut PacketVolumeStats, data: &[u8]) -> Result<(), EtherReadError> {
+fn packet_volume(stats: &mut Pvs, data: &[u8]) -> Result<(), EtherReadError> {
 	let pkt = PacketHeaders::from_ip_slice(data)?;
 
 	let pkt_size = match pkt.ip {
@@ -312,7 +385,7 @@ fn packet_volume(stats: &mut PacketVolumeStats, data: &[u8]) -> Result<(), Ether
 	Ok(())
 }
 
-fn packet_volume_emergency(stats: &mut PacketVolumeStats, data: &[u8]) -> Result<(), EtherReadError> {
+fn packet_volume_emergency(stats: &mut Pvs, data: &[u8]) -> Result<(), EtherReadError> {
 	let (ip, _rest) = IpHeader::read_from_slice(data)?;
 
 	let (len, proto) = match ip {
@@ -340,72 +413,3 @@ fn get_important_links(doc: &Document) -> impl Iterator<Item = &str> {
 				.filter(|&href| href == tag.text().as_str())
 		})
 }
-
-#[derive(Debug)]
-enum LocalError {
-	Http(HttpError),
-	Io(IoError),
-	Pcap(PcapError),
-	Reqwest(ReqwestError),
-	RonSer(RonSerError),
-}
-
-impl Error for LocalError {
-	fn description(&self) -> &str {
-		use LocalError::*;
-
-		match self {
-			Http(e) => e.description(),
-			Io(e) => e.description(),
-			Pcap(e) => e.description(),
-			Reqwest(e) => e.description(),
-			RonSer(e) => e.description(),
-		}
-	}
-}
-
-impl fmt::Display for LocalError {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		use LocalError::*;
-
-		match self {
-			Http(e) => e.fmt(f),
-			Io(e) => e.fmt(f),
-			Pcap(e) => e.fmt(f),
-			Reqwest(e) => e.fmt(f),
-			RonSer(e) => e.fmt(f),
-		}
-	}
-}
-
-impl From<HttpError> for LocalError {
-	fn from(t: HttpError) -> Self {
-		LocalError::Http(t)
-	}
-}
-
-impl From<IoError> for LocalError {
-	fn from(t: IoError) -> Self {
-		LocalError::Io(t)
-	}
-}
-
-impl From<PcapError> for LocalError {
-	fn from(t: PcapError) -> Self {
-		LocalError::Pcap(t)
-	}
-}
-
-impl From<ReqwestError> for LocalError {
-	fn from(t: ReqwestError) -> Self {
-		LocalError::Reqwest(t)
-	}
-}
-
-impl From<RonSerError> for LocalError {
-	fn from(t: RonSerError) -> Self {
-		LocalError::RonSer(t)
-	}
-}
-
-type LocalResult<T> = Result<T, LocalError>;

@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 bytes = "0.4"
+csv = "1"
 etherparse = "0.8"
 futures = "0.1"
 http = "0.1"
