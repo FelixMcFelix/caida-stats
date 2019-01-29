@@ -24,8 +24,9 @@ impl ChunkReader {
 		}
 	}
 }
-
 impl Read for ChunkReader {
+	
+	#[allow(unused_assignments)]
 	fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
 		let init = buf.len();
 		let mut remaining = init;
