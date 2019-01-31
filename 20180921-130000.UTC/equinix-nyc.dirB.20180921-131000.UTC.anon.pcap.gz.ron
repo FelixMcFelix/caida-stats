@@ -1,0 +1,1 @@
+(udp_non_quic:(count:20503488,volume:7649589671,),udp_unknown:(count:2361347,volume:2355850326,),udp_quic:(count:436599,volume:324039960,),tcp:(count:78477397,volume:28562770938,),other:(count:3230751,volume:1136346388,),)
