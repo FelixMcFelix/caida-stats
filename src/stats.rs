@@ -107,6 +107,12 @@ pub struct VolumeStatRow<'a> {
 
 	pub frac_pkts_other: f64,
 	pub frac_bytes_other: f64,
+
+	pub frac_pkts_quic: f64,
+	pub frac_bytes_quic: f64,
+
+	pub total_count: u64,
+	pub total_volume: u64,
 }
 
 impl<'a> VolumeStatRow<'a> {
@@ -133,6 +139,12 @@ impl<'a> VolumeStatRow<'a> {
 
 			frac_pkts_other: (stats.other.count as f64) / t_c,
 			frac_bytes_other: (stats.other.volume as f64) / t_v,
+
+			frac_pkts_quic: (stats.udp_quic.count as f64) / t_c,
+			frac_bytes_quic: (stats.udp_quic.volume as f64) / t_v,
+
+			total_count: total.count,
+			total_volume: total.volume,
 		}
 	}
 }

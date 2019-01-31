@@ -22,3 +22,7 @@ The CSV package for Rust is a little picky when it comes to printing headers for
 | UDP Percentage (Bytes) | f64 |
 | Other Percentage (Packets) | f64 |
 | Other Percentage (Bytes) | f64 |
+| Quic Percentage (Packets) | f64 |
+| Quic Percentage (Bytes) | f64 |
+| Total Packets | u64 |
+| Total Bytes | u64 |
