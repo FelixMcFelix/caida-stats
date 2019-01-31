@@ -7,7 +7,7 @@ use crate::{
 	error::*,
 	stats::*,
 };
-use csv::Writer;
+use csv::WriterBuilder;
 use etherparse::{
 	IpHeader,
 	IpTrafficClass,
@@ -52,8 +52,6 @@ use std::{
 	},
 	io::{
 		self,
-		Seek,
-		SeekFrom,
 		Write,
 	},
 	sync::{
@@ -76,6 +74,7 @@ const DATA_URL: &str = "https://data.caida.org/datasets/passive-2018/equinix-nyc
 const MIN_RETRY_DELAY: u64 = 1_000;
 const MAX_RETRY_DELAY: u64 = 5_000;
 
+const MONTHS: &[&str] = &["Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const MONTH_PATCHES: &[usize] = &[10, 5, 2, 1];
 const RESULTS_DIR: &str = "results/";
 
@@ -93,7 +92,7 @@ fn main() -> LocalResult<()> {
 	}
 
 	// Get password.
-	let password = rpassword::prompt_password_stdout("Password:")?;
+	let password = rpassword::prompt_password_stdout("Password: ")?;
 	println!();
 
 	let client = Client::new();
@@ -191,23 +190,26 @@ fn main() -> LocalResult<()> {
 	};
 
 	let _ = fs::create_dir_all(RESULTS_DIR);
-	let mut month_stats = month_stats.into_iter();
+	let month_stats = month_stats.into_iter();
 
 	#[inline]
 	fn patch_size_string(patch_size: usize, i: usize) -> String {
 		if patch_size > 1 {
-			format!("{}-{}", i - patch_size + 1, i)
+			format!("{}-{}", MONTHS[i - patch_size + 1], MONTHS[i])
 		} else {
-			format!("{}", i)
+			format!("{}", MONTHS[i])
 		}
 	}
 
 	for patch_size in MONTH_PATCHES {
 		for (name_mod, extract_fn) in &settings {
-			let mut wrt = Writer::from_path(format!("{0}{1}-{2}.csv", RESULTS_DIR, name_mod, patch_size))?;
+			// let mut wb = WriterBuilder::new().has_headers(false);
+			let mut wrt = WriterBuilder::new()
+				.has_headers(false)
+				.from_path(format!("{0}{1}-{2}.csv", RESULTS_DIR, name_mod, patch_size))?;
 			let mut current_stat = None;
 
-			for (i, month) in month_stats.by_ref().map(extract_fn).enumerate() {
+			for (i, month) in month_stats.clone().map(extract_fn).enumerate() {
 				current_stat = if let Some(s) = current_stat {
 					Some(s + month)
 				} else {
@@ -243,12 +245,14 @@ fn pvs_2(x: Pvs3) -> Pvs { x.2 }
 fn save_and_scan_back<S>(out_file: &str, to_save: S) -> LocalResult<File>
 	where S: Serialize
 {
-	let mut out = File::create(out_file)?;
+	// Scanning would make sense, but doesn't seem to work for whatever reason.
+	{
+		let mut out = File::create(out_file)?;
+		out.write_all(ser::to_string(&to_save)?.as_bytes())?;
+		// out.seek(SeekFrom::Start(0))?;
+	}
 
-	out.write_all(ser::to_string(&to_save)?.as_bytes())?;
-	out.seek(SeekFrom::Start(0))?;
-
-	Ok(out)
+	File::open(out_file).map_err(Into::into)
 }
 
 fn process_file(
