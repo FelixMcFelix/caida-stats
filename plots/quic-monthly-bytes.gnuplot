@@ -6,7 +6,7 @@ load "gnuplot-palettes/inferno.pal"
 set boxwidth 0.9
 set style data histogram
 set style histogram cluster gap 1
-set style fill solid border -1
+set style fill solid border
 set datafile separator ","
 unset colorbox
 
