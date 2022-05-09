@@ -11,7 +11,7 @@ set datafile separator ","
 unset colorbox
 
 set xlabel "Month"
-set ylabel "Proportion"
+set ylabel "Proportion (Bytes)"
 
 set yrange [0.0:0.35]
 set key at 10,0.38
